@@ -160,9 +160,12 @@ pub fn write_atomically_with(
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or("save");
     // A file that is replaced keeps its permissions (#1790) and group on Unix, and its hidden and
-    // system attributes on Windows (#4593).
-    #[cfg(any(unix, windows))]
+    // system attributes on Windows (#4593). A save replaces a symbolic link, not the file it
+    // points to, so on Windows the attributes are the link's own.
+    #[cfg(unix)]
     let keep = std::fs::metadata(path).ok();
+    #[cfg(windows)]
+    let keep = std::fs::symlink_metadata(path).ok();
     #[cfg(not(any(unix, windows)))]
     let keep = None;
     // A saved file is the same document: it keeps its creation date (#2658).
@@ -708,6 +711,36 @@ mod tests {
         let fresh = dir.join("new.pdf");
         write_atomically(&fresh, b"NEW", StagingName::TagThenSuffix).unwrap();
         assert_eq!(kept(&fresh), 0, "a new file is neither hidden nor system");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A save replaces a symbolic link, not the file it points to, so the saved file takes the
+    /// link's own attributes: a plain link to a hidden file saves as a plain file, and the file
+    /// it pointed to is left as it was.
+    #[cfg(windows)]
+    #[test]
+    fn a_replaced_link_keeps_its_own_attributes_not_its_targets() {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+        const HIDDEN: u32 = 0x2;
+        let dir = test_dir("link-attributes");
+        let referent = dir.join("referent.pdf");
+        let mut fixture = std::fs::OpenOptions::new().write(true).create_new(true).attributes(HIDDEN).open(&referent).unwrap();
+        std::io::Write::write_all(&mut fixture, b"OLD").unwrap();
+        drop(fixture);
+        let link = dir.join("link.pdf");
+        if let Err(e) = std::os::windows::fs::symlink_file(&referent, &link) {
+            eprintln!("skipped: creating a symbolic link needs Developer Mode or administrator rights ({e})");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(std::fs::symlink_metadata(&link).unwrap().file_attributes() & HIDDEN, 0, "the link itself is visible");
+        write_atomically(&link, b"NEW", StagingName::TagThenSuffix).unwrap();
+        let saved = std::fs::symlink_metadata(&link).unwrap();
+        assert!(!saved.file_type().is_symlink(), "the save replaced the link");
+        assert_eq!(saved.file_attributes() & HIDDEN, 0, "the link was visible, so the saved file is");
+        assert_eq!(std::fs::read(&link).unwrap(), b"NEW");
+        assert_eq!(std::fs::read(&referent).unwrap(), b"OLD", "the file the link pointed to is untouched");
+        assert_ne!(std::fs::metadata(&referent).unwrap().file_attributes() & HIDDEN, 0, "and still hidden");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
